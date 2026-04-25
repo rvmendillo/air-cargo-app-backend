@@ -4,3 +4,5 @@ pydantic
 xmltodict
 python-dotenv
 google.genai
+google.generativeai
+numpy
