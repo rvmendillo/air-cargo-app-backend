@@ -170,7 +170,7 @@ def _parse_shipment(shipment, dg_declaration_obj=None):
             "declarationDate": _get(dg_decl, f"{CARGO}declarationDate"),
             "shipperSignature": _get(dg_decl, f"{DG}shipperSignatory"),
             "complianceMethod": (
-                f"Exclusive use: {_get(dg_decl, f'{CARGO}exclusiveUseIndicator', 'N/A')}"
+                f"{_get(dg_decl, f'{CARGO}exclusiveUseIndicator', 'N/A')}"
             ),
         }
 
@@ -185,8 +185,8 @@ def _parse_shipment(shipment, dg_declaration_obj=None):
             "totalWeight": None,
             "weightUnit": None,
             "pieceCount": str(len(pieces)),
-            "commodity": f"{origin_code or '?'} → {dest_code or '?'}",
             "pieces": pieces,
+            "dgDeclaration": decl_data,
         }
 
     return {
@@ -195,18 +195,24 @@ def _parse_shipment(shipment, dg_declaration_obj=None):
         "totalWeight": None,
         "weightUnit": None,
         "pieceCount": str(len(pieces)),
-        "commodity": None,
         "pieces": pieces,
+        "dgDeclaration": {
+            "declarationType": None,
+            "declarationDate": None,
+            "shipperSignature": None,
+            "complianceMethod": None,
+        },
     }
 
 
 # ── Check parser ────────────────────────────────────────────────────────────
 def _parse_check(check):
-    """Parse a Check object."""
+    """Parse a Check object with nested sub-checks."""
     if not isinstance(check, dict):
         return None
 
     check_name = _get(check, f"{DG}checkname") or _get(check, f"{CARGO}checkName")
+    check_status = _get(check, f"{DG}checkStatus")
 
     # Parse total result
     total_result = _get(check, f"{CARGO}checkTotalResult")
@@ -240,46 +246,44 @@ def _parse_check(check):
             employee_id = _get(checker, f"{CARGO}employeeId", "")
             checked_by = f"{first_name} ({employee_id})".strip() if first_name else employee_id
 
-    # Parse sub-checks as remarks
-    sub_checks = _ensure_list(_get(check, f"{CARGO}checks", []))
-    sub_check_names = [_get(sc, f"{DG}checkname", "Unknown") for sc in sub_checks if isinstance(sc, dict)]
-    remarks = f"Sub-checks: {', '.join(sub_check_names)}" if sub_check_names else _get(check, f"{DG}checkStatus")
+    # Parse sub-checks
+    sub_checks_raw = _ensure_list(_get(check, f"{CARGO}checks", []))
+    sub_checks = []
+    for sc in sub_checks_raw:
+        if not isinstance(sc, dict):
+            continue
+        sc_name = _get(sc, f"{DG}checkname")
+        sc_start_time = _get(sc, f"{CARGO}actionStartTime")
+        sc_end_time = _get(sc, f"{CARGO}actionEndTime")
+        sc_status = _get(sc, f"{DG}checkStatus")
+
+        sc_checker = _get(sc, f"{CARGO}checker")
+        sc_checked_by = None
+        if isinstance(sc_checker, dict):
+            first_name = _get(sc_checker, f"{CARGO}firstName", "")
+            employee_id = _get(sc_checker, f"{CARGO}employeeId", "")
+            sc_checked_by = f"{first_name} ({employee_id})".strip() if first_name else employee_id
+
+        sub_checks.append({
+            "checkId": _get(sc, f"{DG}checkId"),
+            "checkType": sc_name,
+            "checkResult": "OK" if sc_end_time else "PENDING",
+            "checkDate": sc_end_time or sc_start_time,
+            "checkedBy": sc_checked_by,
+            "checkStatus": sc_status,
+            "createdOn": _get(sc, f"{DG}createdOn"),
+        })
 
     return {
+        "checkId": _get(check, f"{DG}checkId"),
         "checkType": check_name,
         "checkResult": result_str,
         "checkDate": check_date,
         "checkedBy": checked_by,
-        "remarks": remarks,
+        "checkStatus": check_status,
+        "createdOn": _get(check, f"{DG}createdOn"),
+        "subChecks": sub_checks,
     }
-
-
-def _parse_sub_checks(check):
-    """Parse sub-checks from a parent Check object into individual CheckResult dicts."""
-    sub_checks_raw = _ensure_list(_get(check, f"{CARGO}checks", []))
-    results = []
-    for sc in sub_checks_raw:
-        if not isinstance(sc, dict):
-            continue
-        check_name = _get(sc, f"{DG}checkname")
-        start_time = _get(sc, f"{CARGO}actionStartTime")
-        end_time = _get(sc, f"{CARGO}actionEndTime")
-
-        checker = _get(sc, f"{CARGO}checker")
-        checked_by = None
-        if isinstance(checker, dict):
-            first_name = _get(checker, f"{CARGO}firstName", "")
-            employee_id = _get(checker, f"{CARGO}employeeId", "")
-            checked_by = f"{first_name} ({employee_id})".strip() if first_name else employee_id
-
-        results.append({
-            "checkType": check_name,
-            "checkResult": "OK" if end_time else "PENDING",
-            "checkDate": end_time or start_time,
-            "checkedBy": checked_by,
-            "remarks": None,
-        })
-    return results
 
 
 # ── Waybill parser ──────────────────────────────────────────────────────────
@@ -383,8 +387,6 @@ def parse_onerecord_awb(raw_json, awb_id=None):
         parent_check = _parse_check(c)
         if parent_check:
             checks.append(parent_check)
-        sub_checks = _parse_sub_checks(c)
-        checks.extend(sub_checks)
 
     # Also look for checks inside house waybills and their shipments
     if not checks:
@@ -396,8 +398,6 @@ def parse_onerecord_awb(raw_json, awb_id=None):
                 parent_check = _parse_check(c)
                 if parent_check:
                     checks.append(parent_check)
-                sub_checks = _parse_sub_checks(c)
-                checks.extend(sub_checks)
             shipment_obj = _get(hwb, f"{CARGO}shipment")
             if isinstance(shipment_obj, dict):
                 ship_checks = _ensure_list(_get(shipment_obj, f"{CARGO}checks", []))
@@ -405,8 +405,6 @@ def parse_onerecord_awb(raw_json, awb_id=None):
                     parent_check = _parse_check(c)
                     if parent_check:
                         checks.append(parent_check)
-                    sub_checks = _parse_sub_checks(c)
-                    checks.extend(sub_checks)
 
     return {
         "masterWaybill": master_waybill,
