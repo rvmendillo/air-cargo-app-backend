@@ -2,11 +2,19 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import time
-from conversion.services.xml_to_json_service import convert_xml_string_to_json, convert_xml_string_to_readable_json
+import httpx
+from conversion.services.xml_to_json_service import convert_xml_string_to_json
 from ai.models.request import RequestData
 from ai.services.ai_service import run_ai
+from onerecord.parser import parse_onerecord_awb
 
 app = FastAPI(title="Air Cargo Dashboard API")
+
+# ── ONE Record configuration ────────────────────────────────────────────────
+ONERECORD_AUTH_URL = "https://champ-onerecord.germanywestcentral.cloudapp.azure.com/auth/realms/onerecord/protocol/openid-connect/token"
+ONERECORD_API_BASE = "https://champ-onerecord.germanywestcentral.cloudapp.azure.com/api/AIR_CARGO_RANGERS/logistics-objects"
+ONERECORD_CLIENT_ID = "onerecord-a1r-cargo-rangers"
+ONERECORD_CLIENT_SECRET = "ZuH40SeVGWrt7xgaLbuMILAHKJGSgY69"
 
 # Setup CORS for the Angular frontend
 app.add_middleware(
@@ -20,7 +28,7 @@ app.add_middleware(
 class JSONPayload(BaseModel):
     json_data: str
 
-@app.post("/api/dg/convert")
+@app.post("/api/dg/create")
 async def convert_xml_to_json(request: Request):
     """
     Accepts raw XML string directly in the body.
@@ -34,26 +42,6 @@ async def convert_xml_to_json(request: Request):
             raise HTTPException(status_code=400, detail="No XML data provided")
 
         result = convert_xml_string_to_json(xml_string)
-        
-        return result
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
-    
-@app.post("/api/dg/read")
-async def convert_to_readable(request: Request):
-    """
-    Accepts raw XML string directly in the body.
-    """
-    try:
-        raw_body = await request.body()
-        
-        xml_string = raw_body.decode("utf-8")
-        
-        if not xml_string:
-            raise HTTPException(status_code=400, detail="No XML data provided")
-
-        result = convert_xml_string_to_readable_json(xml_string)
         
         return result
     
@@ -191,5 +179,65 @@ def get_uld_status():
 
 @app.post("/ai")
 def ai_endpoint(data: RequestData):
-    result = run_ai(data.text)
+    result = run_ai(data.text, context=data.context)
     return {"result": result}
+
+@app.get("/token")
+def get_token():
+    return {"token": "123"}
+
+@app.get("/api/onerecord/awb/{awb_id}")
+async def get_onerecord_awb(awb_id: str):
+    """
+    Proxy endpoint: acquires an OAuth token from the ONE Record auth server,
+    then fetches AWB data from the external ONE Record API.
+    Keeps client credentials on the server side.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Step 1: Get access token
+            token_response = await client.post(
+                ONERECORD_AUTH_URL,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": ONERECORD_CLIENT_ID,
+                    "client_secret": ONERECORD_CLIENT_SECRET,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            if token_response.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to obtain access token: {token_response.text}",
+                )
+            access_token = token_response.json().get("access_token")
+            if not access_token:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Access token not found in auth response",
+                )
+
+            # Step 2: Fetch AWB data using the token
+            awb_response = await client.get(
+                f"{ONERECORD_API_BASE}/awb-{awb_id}",
+                params={"embedded": "true"},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if awb_response.status_code != 200:
+                raise HTTPException(
+                    status_code=awb_response.status_code,
+                    detail=f"ONE Record API error: {awb_response.text}",
+                )
+            raw_data = awb_response.json()
+            # Parse the JSON-LD into structured dashboard data
+            return parse_onerecord_awb(raw_data, awb_id=awb_id)
+
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error communicating with ONE Record services: {str(e)}",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")

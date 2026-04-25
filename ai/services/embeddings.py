@@ -1,4 +1,4 @@
-import google.generativeai as genai
+from ..core.gemini import genai
 import numpy as np
 
 
