@@ -1,12 +1,9 @@
 import os
 import warnings
-from pathlib import Path
 from dotenv import load_dotenv
 import google.generativeai as genai
 
-# Ensure .env is loaded from the backend directory
-env_path = Path(__file__).resolve().parent.parent.parent / ".env"
-load_dotenv(dotenv_path=env_path)
+load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
 
